@@ -219,32 +219,69 @@ static __always_inline void
 __pthread_rwlock_rdunlock (pthread_rwlock_t *rwlock)
 {
   int private = __pthread_rwlock_get_private (rwlock);
-  /* We decrease the number of readers, and if we are the last reader and
-     there is a primary writer, we start a write phase.  We use a CAS to
-     make this atomic so that it is clear whether we must hand over ownership
-     explicitly.  */
+
+  /* rcuref-inspired adaptive unlock.  We use a speculative relaxed load to
+     determine which path to take:
+
+     - If the reader count appears > 1 (multiple concurrent readers), we use
+       an unconditional atomic_fetch_add to decrement.  This avoids the O(N^2)
+       CAS retry storm: all N readers succeed in one shot, O(N) aggregate.
+       The thread whose fetch_add brings count to 0 handles flag transitions.
+
+     - If the reader count appears <= 1 (we are likely the sole/last reader),
+       we fall back to the original single-CAS path.  This is optimal for the
+       R=1 case: one atomic RMW that decrements AND sets flags atomically.
+
+     The speculative load is a plain relaxed load (no bus lock, hits L1 on
+     x86 since we just accessed nearby data in the critical section).  It
+     may be stale — that is fine:
+       - If we speculatively read count > 1 but count is actually 1, our
+         fetch_add brings count to 0 and we handle flags in the recovery path.
+       - If we speculatively read count <= 1 but count is actually > 1, we
+         take the CAS path which is correct (just less scalable for this one
+         unlock — but this misspeculation is rare under sustained contention).
+   */
   unsigned int r = atomic_load_relaxed (&rwlock->__data.__readers);
+
+  if (__glibc_likely ((r >> PTHREAD_RWLOCK_READER_SHIFT) > 1))
+    {
+      /* Fast path: multiple readers present.  Unconditional decrement —
+	 no CAS retry loop.  O(N) aggregate cost.  */
+      unsigned int old = atomic_fetch_add_release (&rwlock->__data.__readers,
+	  -(1 << PTHREAD_RWLOCK_READER_SHIFT));
+
+      if (__glibc_likely ((old >> PTHREAD_RWLOCK_READER_SHIFT) > 1))
+	return;
+
+      /* Recovery: despite speculative load showing count > 1, our fetch_add
+	 actually brought count from 1 to 0 (the speculative load was stale).
+	 We must handle flag transitions.  This is rare — only when count
+	 drops between our load and fetch_add.  */
+      r = atomic_load_relaxed (&rwlock->__data.__readers);
+      goto flag_fixup;
+    }
+
+  /* Slow path: likely the last reader (count <= 1 speculatively).  Use the
+     original single-CAS approach: decrement and set flags in one atomic.
+     This gives identical performance to the unpatched code when R=1.
+     We need release MO here for three reasons.  First, so that we
+     synchronize with subsequent writers.  Second, we might have been the
+     first reader and set __wrphase_futex to 0, so we need to synchronize
+     with the last reader that will set it to 1 (note that we will always
+     change __readers before the last reader, or we are the last reader).
+     Third, a writer that takes part in explicit hand-over needs to see
+     the first reader's store to __wrphase_futex (or a later value) if
+     the writer observes that a write phase has been started.  */
   unsigned int rnew;
   for (;;)
     {
       rnew = r - (1 << PTHREAD_RWLOCK_READER_SHIFT);
-      /* If we are the last reader, we also need to unblock any readers
-	 that are waiting for a writer to go first (PTHREAD_RWLOCK_RWAITING)
-	 so that they can register while the writer is active.  */
       if ((rnew >> PTHREAD_RWLOCK_READER_SHIFT) == 0)
 	{
 	  if ((rnew & PTHREAD_RWLOCK_WRLOCKED) != 0)
 	    rnew |= PTHREAD_RWLOCK_WRPHASE;
 	  rnew &= ~(unsigned int) PTHREAD_RWLOCK_RWAITING;
 	}
-      /* We need release MO here for three reasons.  First, so that we
-	 synchronize with subsequent writers.  Second, we might have been the
-	 first reader and set __wrphase_futex to 0, so we need to synchronize
-	 with the last reader that will set it to 1 (note that we will always
-	 change __readers before the last reader, or we are the last reader).
-	 Third, a writer that takes part in explicit hand-over needs to see
-	 the first reader's store to __wrphase_futex (or a later value) if
-	 the writer observes that a write phase has been started.  */
       if (atomic_compare_exchange_weak_release (&rwlock->__data.__readers,
 						&r, rnew))
 	break;
@@ -253,7 +290,7 @@ __pthread_rwlock_rdunlock (pthread_rwlock_t *rwlock)
   if ((rnew & PTHREAD_RWLOCK_WRPHASE) != 0)
     {
       /* We need to do explicit hand-over.  We need the acquire MO fence so
-	 that our modification of _wrphase_futex happens after a store by
+	 that our modification of __wrphase_futex happens after a store by
 	 another reader that started a read phase.  Relaxed MO is sufficient
 	 for the modification of __wrphase_futex because it is just used
 	 to delay acquisition by a writer until all threads are unblocked
@@ -266,6 +303,35 @@ __pthread_rwlock_rdunlock (pthread_rwlock_t *rwlock)
 	futex_wake (&rwlock->__data.__wrphase_futex, INT_MAX, private);
     }
   /* Also wake up waiting readers if we did reset the RWAITING flag.  */
+  if ((r & PTHREAD_RWLOCK_RWAITING) != (rnew & PTHREAD_RWLOCK_RWAITING))
+    futex_wake (&rwlock->__data.__readers, INT_MAX, private);
+  return;
+
+flag_fixup:
+  /* Flag fixup for the fast-path recovery case.  Our fetch_add already
+     brought count to 0.  Now atomically set WRPHASE / clear RWAITING
+     if needed.  This CAS is uncontended (only one thread reaches here).  */
+  for (;;)
+    {
+      if ((r >> PTHREAD_RWLOCK_READER_SHIFT) != 0)
+	return;  /* New reader arrived — it takes over responsibility.  */
+      rnew = r;
+      if ((rnew & PTHREAD_RWLOCK_WRLOCKED) != 0)
+	rnew |= PTHREAD_RWLOCK_WRPHASE;
+      rnew &= ~(unsigned int) PTHREAD_RWLOCK_RWAITING;
+      if (rnew == r)
+	return;  /* No flags to change (idle transition).  */
+      if (atomic_compare_exchange_weak_release (&rwlock->__data.__readers,
+						&r, rnew))
+	break;
+    }
+  if ((rnew & PTHREAD_RWLOCK_WRPHASE) != 0)
+    {
+      atomic_thread_fence_acquire ();
+      if ((atomic_exchange_relaxed (&rwlock->__data.__wrphase_futex, 1)
+	   & PTHREAD_RWLOCK_FUTEX_USED) != 0)
+	futex_wake (&rwlock->__data.__wrphase_futex, INT_MAX, private);
+    }
   if ((r & PTHREAD_RWLOCK_RWAITING) != (rnew & PTHREAD_RWLOCK_RWAITING))
     futex_wake (&rwlock->__data.__readers, INT_MAX, private);
 }
